@@ -1,5 +1,6 @@
 module Aws.Lambda.Runtime
   ( runLambda
+  , runLambdaWithCache
   , Runtime.RunCallback
   , Runtime.LambdaResult(..)
   ) where
@@ -29,6 +30,21 @@ runLambda callback = do
       `catch` \err -> Publish.invocationError err lambdaApi context manager)
       `catch` \(err :: Error.EnvironmentVariableNotSet) -> Publish.runtimeInitError err lambdaApi context manager
 
+runLambdaWithCache :: (Runtime.LambdaOptions -> a -> IO (Either String (Runtime.LambdaResult, a))) -> a -> IO ()
+runLambdaWithCache callback initCache = do
+  manager <- Http.newManager httpManagerSettings
+  lambdaApi <- Environment.apiEndpoint `catch` variableNotSet
+  let go cache =
+          do event    <- ApiInfo.fetchEvent manager lambdaApi `catch` errorParsing
+             context  <- Context.initialize event `catch` errorParsing `catch` variableNotSet
+             newCache <- ((invokeAndRunWithCache callback manager lambdaApi event context cache
+                           `catch` \err -> cache <$ Publish.parsingError err lambdaApi context manager)
+                           `catch` \err -> cache <$ Publish.invocationError err lambdaApi context manager)
+                           `catch` \(err :: Error.EnvironmentVariableNotSet) -> cache <$ Publish.runtimeInitError err lambdaApi context manager
+             go newCache
+  go initCache
+
+
 httpManagerSettings :: Http.ManagerSettings
 httpManagerSettings =
   -- We set the timeout to none, as AWS Lambda freezes the containers.
@@ -50,6 +66,22 @@ invokeAndRun callback manager lambdaApi event context = do
   Publish.result result lambdaApi context manager
     `catch` \err -> Publish.invocationError err lambdaApi context manager
 
+invokeAndRunWithCache
+  :: Throws Error.Invocation
+  => Throws Error.EnvironmentVariableNotSet
+  => (Runtime.LambdaOptions -> a -> IO (Either String (Runtime.LambdaResult, a)))
+  -> Http.Manager
+  -> String
+  -> ApiInfo.Event
+  -> Context.Context
+  -> a
+  -> IO a
+invokeAndRunWithCache callback manager lambdaApi event context cache = do
+  (result, newCache) <- invokeWithCallbackWithCache callback event context cache
+  Publish.result result lambdaApi context manager
+    `catch` \err -> Publish.invocationError err lambdaApi context manager
+  return newCache
+
 invokeWithCallback
   :: Throws Error.Invocation
   => Throws Error.EnvironmentVariableNotSet
@@ -66,6 +98,29 @@ invokeWithCallback callback event context = do
                       , executionUuid = ""  -- DirectCall doesnt use UUID
                       }
   result <- callback lambdaOptions
+  case result of
+    Left err ->
+      throw $ Error.Invocation err
+    Right value ->
+      pure value
+
+invokeWithCallbackWithCache
+  :: Throws Error.Invocation
+  => Throws Error.EnvironmentVariableNotSet
+  => (Runtime.LambdaOptions -> a -> IO (Either String (Runtime.LambdaResult, a)))
+  -> ApiInfo.Event
+  -> Context.Context
+  -> a
+  -> IO (Runtime.LambdaResult, a)
+invokeWithCallbackWithCache callback event context cache = do
+  handlerName <- Environment.handlerName
+  let lambdaOptions = Runtime.LambdaOptions
+                      { eventObject = ApiInfo.event event
+                      , contextObject = context
+                      , functionHandler = handlerName
+                      , executionUuid = ""  -- DirectCall doesnt use UUID
+                      }
+  result <- callback lambdaOptions cache
   case result of
     Left err ->
       throw $ Error.Invocation err
